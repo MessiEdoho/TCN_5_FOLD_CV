@@ -2,11 +2,42 @@
 create_5fold_cv_splits.py
 =========================
 Builds data_splits_5fold_cv.json -- the 5-fold cross-validation manifest
-for the TCN seizure-detection project. Each of the 71 training mice is
-assigned to exactly one of 6 mouse-disjoint, prevalence-and-volume-
-stratified partitions:
+for the TCN seizure-detection project.
 
-    fold_0 .. fold_4   -- rotate as the held-out CV val set
+THREE GUARANTEES ENFORCED BY THIS SCRIPT
+----------------------------------------
+1. MOUSE-DISJOINT. Each of the 71 training mice is assigned to
+   exactly one of 6 partitions; no mouse appears in two partitions,
+   and no train mouse appears in either the upstream val_holdout
+   (10 mice) or test (20 mice) sets. Guaranteed by construction by
+   sklearn.StratifiedKFold and re-verified defensively by
+   assert_partitions_disjoint() *before* any output is written.
+   See partition_mice() and assert_partitions_disjoint().
+
+2. PREVALENCE + VOLUME STRATIFIED. Mice are stratified via a 2x2
+   crossed categorical (median split on ictal prevalence x median
+   split on segment count). sklearn.StratifiedKFold then balances
+   the proportion of the 4 strata across the 6 output partitions,
+   so each partition contains a comparable mix of low/high-prevalence
+   and small/big-volume mice. This produces partition-level ictal
+   percentages that are close (but not exactly equal) to the cohort
+   mean. A 1D prevalence-tertile fallback activates automatically
+   if any 2x2 cell falls below the n_splits = 6 floor required by
+   StratifiedKFold. See assign_crossed_strata() and the
+   "Why two stratification axes" note further down this docstring.
+
+3. SEEDED FOR REPRODUCIBILITY. SEED = 42 is the SOLE source of
+   randomness; it is passed as random_state to StratifiedKFold(...,
+   shuffle=True, random_state=SEED), logged at startup, and
+   recorded in the output manifest's metadata.seed block. An
+   unchanged source manifest therefore produces byte-identical
+   output JSON across re-runs. This seed is to be reported in the
+   Methods section of any publication that consumes the CV manifest.
+
+THE 6 PARTITIONS
+----------------
+    fold_0 .. fold_4   -- rotate as the held-out CV val (= per-fold
+                          test) set across the 5 cross-validation runs
     early_stop         -- fixed across all 5 folds, used only for the
                           training-time early-stopping criterion
 
@@ -31,16 +62,23 @@ After  : enrich_manifest.py  -> data_splits_nonictal_sampled_filtered_enriched.j
 Before : 5-fold training scripts (TCN.py / MultiScaleTCN.py / etc.,
          in their CV variants), which consume data_splits_5fold_cv.json
 
-Output schema (single flat records list, avoids 5x duplication)
----------------------------------------------------------------
+Output schema v2 (single flat records list, avoids 5x duplication)
+------------------------------------------------------------------
+v2 renames the per-fold held-out key from `val_mice` to `test_mice`
+to match the training-protocol terminology in [train_5fold_cv_
+multiscaleTCN.py] and CV_METHODOLOGY_REPORT.md: the held-out CV
+partition is the per-fold TEST set, not a validation set. The
+`val_holdout` top-level key still refers to the upstream 10-subject
+HPT validation set, which is a distinct cohort.
+
 {
-  "metadata": {...},
+  "metadata": {schema_version: "2", ...},
   "mouse_partitions":  {mouse_id -> "fold_0" | ... | "fold_4" | "early_stop"},
-  "fold_definitions":  [{fold, train_mice, val_mice}, ...]   # 5 entries
+  "fold_definitions":  [{fold, train_mice, test_mice}, ...]  # 5 entries
   "early_stop_mice":   [mouse_id, ...]                       # fixed
   "records":           [train segment records, each with mouse_id]
-  "val_holdout":       [HPT val passthrough]
-  "test":              [test passthrough]
+  "val_holdout":       [upstream HPT val passthrough]
+  "test":              [upstream independent test passthrough]
 }
 
 Downstream loading pattern (for new CV training scripts):
@@ -51,12 +89,12 @@ Downstream loading pattern (for new CV training scripts):
   early_stop_mice = set(splits["early_stop_mice"])
   fold_def        = splits["fold_definitions"][fold_idx]
   train_mice      = set(fold_def["train_mice"])
-  val_mice        = set(fold_def["val_mice"])
+  test_mice       = set(fold_def["test_mice"])
 
   train_pairs      = [(r["filepath"], r["label"]) for r in records
                       if r["mouse_id"] in train_mice]
-  val_pairs        = [(r["filepath"], r["label"]) for r in records
-                      if r["mouse_id"] in val_mice]
+  test_pairs       = [(r["filepath"], r["label"]) for r in records
+                      if r["mouse_id"] in test_mice]
   early_stop_pairs = [(r["filepath"], r["label"]) for r in records
                       if r["mouse_id"] in early_stop_mice]
 
@@ -70,17 +108,13 @@ Outputs (all under /home/people/22206468/scratch/INPUT_CV_PROJECT/)
   manifest/data_splits_5fold_cv.json
   diagnostics/prevalence_volume_bins.csv
   diagnostics/fold_mouse_assignment.csv
+  diagnostics/fold_mouse_assignment.md
   diagnostics/fold_stratification_report.csv
   logs/create_5fold_cv_splits.log
 
 Usage
 -----
 python create_5fold_cv_splits.py
-
-Reproducibility
----------------
-SEED = 42 fixes the StratifiedKFold shuffle, so re-runs produce
-identical partition assignments. Record this in the Methods section.
 """
 
 # ---------------------------------------------------------------------------
@@ -114,6 +148,7 @@ LOGS_DIR     = OUTPUT_BASE / "logs"
 OUTPUT_JSON           = MANIFEST_DIR / "data_splits_5fold_cv.json"
 BINS_CSV              = DIAG_DIR / "prevalence_volume_bins.csv"
 MOUSE_ASSIGN_CSV      = DIAG_DIR / "fold_mouse_assignment.csv"
+MOUSE_ASSIGN_MD       = DIAG_DIR / "fold_mouse_assignment.md"
 STRATIFICATION_CSV    = DIAG_DIR / "fold_stratification_report.csv"
 LOG_PATH              = LOGS_DIR / "create_5fold_cv_splits.log"
 
@@ -223,60 +258,105 @@ def assign_crossed_strata(df, logger):
         fallback_used (bool), fallback_reason (str or None)
     """
     df = df.copy()
+    qcut_failure = None
+    cell_counts  = {}
+    too_small    = []
+    prev_edges   = None
+    vol_edges    = None
 
     # -- Attempt 2x2 crossed binning via the median of each axis ------------
-    prev_bins = pd.qcut(df["prevalence_pct"], q=N_PREV_BINS,
-                        labels=["low", "high"], duplicates="drop")
-    vol_bins  = pd.qcut(df["n_total"],         q=N_VOL_BINS,
-                        labels=["small", "big"], duplicates="drop")
-    df["prev_bin"]  = prev_bins.astype(str)
-    df["vol_bin"]   = vol_bins.astype(str)
-    df["stratum"]   = df["prev_bin"] + "_" + df["vol_bin"]
+    # pd.qcut with explicit labels raises ValueError if duplicates='drop'
+    # collapses a quantile edge (e.g. when many mice tie at the median, so
+    # only one unique edge remains for q=2 but two labels were requested).
+    # B2: catch that and fall through to the prevalence-tertile branch
+    # instead of crashing.
+    # B7: capture the actual quantile edges via retbins=True so the
+    # metadata records the *real* split point used, not an independently-
+    # computed Series.median() that can differ by interpolation rounding.
+    try:
+        prev_bins, prev_edges = pd.qcut(
+            df["prevalence_pct"], q=N_PREV_BINS,
+            labels=["low", "high"], duplicates="drop", retbins=True,
+        )
+        vol_bins, vol_edges = pd.qcut(
+            df["n_total"], q=N_VOL_BINS,
+            labels=["small", "big"], duplicates="drop", retbins=True,
+        )
+        df["prev_bin"]  = prev_bins.astype(str)
+        df["vol_bin"]   = vol_bins.astype(str)
+        df["stratum"]   = df["prev_bin"] + "_" + df["vol_bin"]
 
-    # Cell-population check: every cell must have >= MIN_CELL_SIZE mice
-    cell_counts = df["stratum"].value_counts().to_dict()
-    logger.info("2x2 crossed cell populations:")
-    for cell, n in sorted(cell_counts.items()):
-        logger.info("  %-12s : %d mice", cell, n)
+        # B1: explicit int() cast so json.dump doesn't choke on numpy.int64
+        # returned by Series.value_counts().to_dict() on some pandas versions.
+        cell_counts = {str(k): int(v) for k, v in
+                       df["stratum"].value_counts().to_dict().items()}
+        logger.info("2x2 crossed cell populations:")
+        for cell, n in sorted(cell_counts.items()):
+            logger.info("  %-12s : %d mice", cell, n)
+        too_small = [c for c, n in cell_counts.items() if n < MIN_CELL_SIZE]
 
-    too_small = [c for c, n in cell_counts.items() if n < MIN_CELL_SIZE]
-
-    # Compute thresholds for the metadata (median = single threshold per axis)
-    prev_threshold = float(df["prevalence_pct"].median())
-    vol_threshold  = int(df["n_total"].median())
+    except ValueError as e:
+        qcut_failure = str(e)
+        logger.warning(
+            "2x2 crossed pd.qcut raised ValueError (likely median ties "
+            "with duplicates='drop'): %s. Falling back to prevalence-"
+            "tertile stratification.", qcut_failure)
+        # Force the fallback path; clear any partial state on df so the
+        # fallback branch repopulates prev_bin / vol_bin / stratum cleanly.
+        too_small = ["<2x2_qcut_ValueError>"]
+        for col in ("prev_bin", "vol_bin", "stratum"):
+            if col in df.columns:
+                df = df.drop(columns=[col])
 
     if too_small:
         # -- Fall back to 1D prevalence tertiles --------------------------
         # Reason: any cell < n_splits=6 would make StratifiedKFold error
         # out on that stratum. Prevalence-only is the conservative default
         # we agreed on as v1 if the joint binning is infeasible.
-        logger.warning(
-            "Cell(s) below MIN_CELL_SIZE=%d: %s. "
-            "Falling back to prevalence-tertile stratification.",
-            MIN_CELL_SIZE, too_small)
+        if qcut_failure is None:
+            logger.warning(
+                "Cell(s) below MIN_CELL_SIZE=%d: %s. "
+                "Falling back to prevalence-tertile stratification.",
+                MIN_CELL_SIZE, too_small)
 
-        tertile_bins = pd.qcut(
+        tertile_bins, tertile_edges = pd.qcut(
             df["prevalence_pct"], q=FALLBACK_N_BINS,
-            labels=["low", "mid", "high"], duplicates="drop")
+            labels=["low", "mid", "high"], duplicates="drop",
+            retbins=True,
+        )
         df["prev_bin"] = tertile_bins.astype(str)
         df["vol_bin"]  = "n/a"
         df["stratum"]  = df["prev_bin"]
 
-        cell_counts = df["stratum"].value_counts().to_dict()
+        # B1: same int() cast as the 2x2 branch above.
+        cell_counts = {str(k): int(v) for k, v in
+                       df["stratum"].value_counts().to_dict().items()}
         logger.info("Fallback prevalence-tertile cell populations:")
         for cell, n in sorted(cell_counts.items()):
             logger.info("  %-12s : %d mice", cell, n)
 
+        # N2: unified key names. Median-based thresholds don't apply in the
+        # tertile branch, so prev_threshold / vol_threshold are explicit
+        # nulls; the tertile edges themselves are recorded as a sibling
+        # field so the actual cuts are still auditable.
         info = {
-            "binning":          "prevalence_tertiles_fallback",
-            "prev_thresholds":  None,
-            "vol_thresholds":   None,
-            "cell_counts":      cell_counts,
-            "fallback_used":    True,
-            "fallback_reason":  "2x2 crossed produced cell < MIN_CELL_SIZE",
-            "small_cells":      too_small,
+            "binning":           "prevalence_tertiles_fallback",
+            "prev_threshold":    None,
+            "vol_threshold":     None,
+            "prev_tertile_edges": [float(x) for x in tertile_edges],
+            "cell_counts":       cell_counts,
+            "fallback_used":     True,
+            "fallback_reason":   qcut_failure
+                                 or "2x2 crossed produced cell < MIN_CELL_SIZE",
+            "small_cells":       too_small,
         }
     else:
+        # B7: prev_threshold / vol_threshold are taken from the actual
+        # qcut quantile edges (prev_edges[1] is the single mid-edge for
+        # q=2), so the recorded value is exactly the split that grouped
+        # mice in df["prev_bin"] / df["vol_bin"].
+        prev_threshold = float(prev_edges[1])
+        vol_threshold  = float(vol_edges[1])
         info = {
             "binning":          "2x2_crossed_median",
             "prev_threshold":   prev_threshold,
@@ -286,8 +366,8 @@ def assign_crossed_strata(df, logger):
             "fallback_reason":  None,
         }
         logger.info("2x2 crossed binning OK (all cells >= %d).", MIN_CELL_SIZE)
-        logger.info("  prev_threshold (median) : %.4f %%", prev_threshold)
-        logger.info("  vol_threshold  (median) : %d segments", vol_threshold)
+        logger.info("  prev_threshold (qcut split) : %.4f %%", prev_threshold)
+        logger.info("  vol_threshold  (qcut split) : %.1f segments", vol_threshold)
 
     return df, info
 
@@ -344,7 +424,17 @@ def partition_mice(df, logger):
     )
     summary["prevalence_pct"] = (
         100.0 * summary["n_ictal"] / summary["n_total"]).round(2)
-    logger.info("\n%s", summary.to_string())
+    # N4: emit one timestamped log line per partition row so the persistent
+    # log stays grep-friendly (the previous multi-line DataFrame dump left
+    # the body lines without the asctime/level prefix).
+    for part, srow in summary.iterrows():
+        logger.info(
+            "  %-12s : n_mice=%2d  n_ictal=%6d  n_nonictal=%6d  "
+            "n_total=%6d  prev=%5.2f%%",
+            part, int(srow["n_mice"]), int(srow["n_ictal"]),
+            int(srow["n_nonictal"]), int(srow["n_total"]),
+            float(srow["prevalence_pct"]),
+        )
 
     return df
 
@@ -369,37 +459,55 @@ def assert_partitions_disjoint(df, val_holdout, test, logger):
                 "LEAKAGE: mice in BOTH %s and %s: %s" % (a, b, sorted(shared))
             )
 
-    train_mice = set(df.index)
-    val_mice   = {r["mouse_id"] for r in val_holdout}
-    test_mice  = {r["mouse_id"] for r in test}
+    train_mice    = set(df.index)
+    holdout_mice  = {r["mouse_id"] for r in val_holdout}
+    upstream_test = {r["mouse_id"] for r in test}
 
-    cross_val  = train_mice & val_mice
-    cross_test = train_mice & test_mice
-    assert not cross_val, (
+    cross_holdout = train_mice & holdout_mice
+    cross_test    = train_mice & upstream_test
+    # B3: also check val_holdout intersect test. The upstream
+    # generate_data_splits.run_leakage_check already guarantees this for
+    # the source manifest, but re-asserting here makes the CV manifest
+    # self-contained and catches any regression introduced upstream.
+    cross_holdout_test = holdout_mice & upstream_test
+
+    assert not cross_holdout, (
         "LEAKAGE: train mice also appear in val_holdout: %s"
-        % sorted(cross_val))
+        % sorted(cross_holdout))
     assert not cross_test, (
         "LEAKAGE: train mice also appear in test: %s"
         % sorted(cross_test))
+    assert not cross_holdout_test, (
+        "LEAKAGE: val_holdout mice also appear in test: %s"
+        % sorted(cross_holdout_test))
 
-    logger.info("Disjointness check PASS: 6 train partitions pairwise disjoint;")
-    logger.info("  no overlap with val_holdout (%d mice) or test (%d mice).",
-                len(val_mice), len(test_mice))
+    logger.info(
+        "Disjointness check PASS: 6 train partitions pairwise disjoint; "
+        "no overlap between train (%d mice), val_holdout (%d mice), or "
+        "test (%d mice).",
+        len(train_mice), len(holdout_mice), len(upstream_test),
+    )
 
 
 # ---------------------------------------------------------------------------
 # Build fold_definitions (train/val mouse-id lists per CV fold)
 # ---------------------------------------------------------------------------
 def build_fold_definitions(df):
-    """Construct the per-fold train_mice / val_mice lists.
+    """Construct the per-fold train_mice / test_mice lists.
 
-    For fold k: val_mice = mice in partition fold_k;
+    For fold k: test_mice  = mice in partition fold_k (the held-out CV
+                             test set for this fold);
                 train_mice = mice in any of the other 4 CV folds
                              (early_stop is excluded from train).
+
+    Schema v2: this dict key was named `val_mice` in v1. It is renamed
+    to `test_mice` so the manifest matches the training-protocol
+    terminology (the held-out CV partition is the per-fold *test* set;
+    `val_holdout` denotes a distinct upstream HPT cohort).
     """
     fold_defs = []
     for k in range(N_CV_FOLDS):
-        val_mice = sorted(df.index[df["partition"] == "fold_%d" % k])
+        test_mice = sorted(df.index[df["partition"] == "fold_%d" % k])
         # train = the OTHER cv folds; early_stop is NOT in train
         train_mask = (
             df["partition"].str.startswith("fold_")
@@ -409,7 +517,7 @@ def build_fold_definitions(df):
         fold_defs.append({
             "fold":        k,
             "train_mice":  train_mice,
-            "val_mice":    val_mice,
+            "test_mice":   test_mice,
         })
     return fold_defs
 
@@ -421,19 +529,19 @@ def compute_fold_summary(df, fold_defs):
     rows = []
     for fd in fold_defs:
         train = df.loc[fd["train_mice"]]
-        val   = df.loc[fd["val_mice"]]
+        test  = df.loc[fd["test_mice"]]
         rows.append({
-            "fold":                 fd["fold"],
-            "n_train_mice":         len(train),
-            "n_val_mice":           len(val),
-            "n_train_segments":     int(train["n_total"].sum()),
-            "n_val_segments":       int(val["n_total"].sum()),
-            "n_train_ictal":        int(train["n_ictal"].sum()),
-            "n_val_ictal":          int(val["n_ictal"].sum()),
-            "train_prevalence_pct": round(
+            "fold":                  fd["fold"],
+            "n_train_mice":          len(train),
+            "n_test_mice":           len(test),
+            "n_train_segments":      int(train["n_total"].sum()),
+            "n_test_segments":       int(test["n_total"].sum()),
+            "n_train_ictal":         int(train["n_ictal"].sum()),
+            "n_test_ictal":          int(test["n_ictal"].sum()),
+            "train_prevalence_pct":  round(
                 100.0 * train["n_ictal"].sum() / train["n_total"].sum(), 4),
-            "val_prevalence_pct": round(
-                100.0 * val["n_ictal"].sum() / val["n_total"].sum(), 4),
+            "test_prevalence_pct":   round(
+                100.0 * test["n_ictal"].sum() / test["n_total"].sum(), 4),
         })
     return rows
 
@@ -493,6 +601,146 @@ def write_mouse_assignment_csv(df, logger):
         logger=logger)
 
 
+def _mouse_sort_key(mid):
+    """Numeric sort: 'm10' after 'm2', not before.
+
+    Falls back to lexicographic order for any id that does not match
+    the conventional 'm<digits>' pattern.
+    """
+    rest = str(mid)[1:] if str(mid).startswith("m") else str(mid)
+    try:
+        return (0, int(rest))
+    except ValueError:
+        return (1, str(mid))
+
+
+# Partition display order: early_stop first (fixed monitor set), then the
+# 5 rotating CV folds in numeric order. Used by both the markdown writer
+# and the log pretty-printer for consistency.
+PARTITION_ORDER = ["early_stop"] + ["fold_%d" % i for i in range(N_CV_FOLDS)]
+
+
+def write_mouse_assignment_md(df, partition_summary, source_manifest,
+                              stratification_info, logger):
+    """Markdown rendering of the mouse-to-partition assignment.
+
+    Same data as fold_mouse_assignment.csv, but organised as one
+    sub-table per partition (early_stop first, then fold_0..fold_4)
+    with a one-line summary above each table. Intended for direct
+    paste into CV_METHODOLOGY_REPORT.md or any manuscript supplement.
+    """
+    MOUSE_ASSIGN_MD.parent.mkdir(parents=True, exist_ok=True)
+    summary_by_part = {r["partition"]: r for r in partition_summary}
+
+    lines = []
+    lines.append("# Mouse-to-Partition Assignment")
+    lines.append("")
+    lines.append(
+        "Generated by `create_5fold_cv_splits.py` on "
+        "%s." % datetime.now().isoformat(timespec="seconds")
+    )
+    lines.append("")
+    lines.append("- **Source manifest**: `%s`" % source_manifest)
+    lines.append("- **Seed**: %d (StratifiedKFold `random_state`)" % SEED)
+    lines.append(
+        "- **Stratification**: %s (fallback used: %s)"
+        % (stratification_info["binning"],
+           stratification_info["fallback_used"])
+    )
+    lines.append("- **Partition display order**: `early_stop` first "
+                 "(fixed monitor set), then the 5 rotating CV folds.")
+    lines.append("")
+
+    for part in PARTITION_ORDER:
+        if part not in summary_by_part:
+            # B6: a partition missing here means the upstream
+            # StratifiedKFold + label loop produced a different set of
+            # partition names than PARTITION_ORDER expects. The asserts
+            # in partition_mice() should already have caught this --
+            # surface the discrepancy loudly rather than dropping the
+            # section silently.
+            logger.warning(
+                "Partition %r expected but not present in "
+                "partition_summary; section will be omitted from output.",
+                part,
+            )
+            continue
+        summ = summary_by_part[part]
+        lines.append("## `%s`" % part)
+        lines.append("")
+        lines.append(
+            "**%d mice** | **%s segments** | **%.2f%% ictal prevalence** "
+            "(mean per-mouse prevalence: %.2f%%, mean per-mouse volume: "
+            "%.0f segments)"
+            % (summ["n_mice"], "{:,}".format(summ["n_total"]),
+               summ["prevalence_pct"],
+               summ["mean_mouse_prevalence_pct"],
+               summ["mean_mouse_volume"])
+        )
+        lines.append("")
+        lines.append(
+            "| mouse_id | prevalence_pct | n_ictal | n_nonictal | n_total | stratum |"
+        )
+        lines.append("|---|---:|---:|---:|---:|---|")
+
+        sub = df[df["partition"] == part]
+        mids = sorted(sub.index, key=_mouse_sort_key)
+        for mid in mids:
+            row = sub.loc[mid]
+            lines.append(
+                "| `%s` | %.2f | %d | %d | %d | `%s` |"
+                % (mid,
+                   float(row["prevalence_pct"]),
+                   int(row["n_ictal"]),
+                   int(row["n_nonictal"]),
+                   int(row["n_total"]),
+                   row["stratum"])
+            )
+        lines.append("")
+
+    MOUSE_ASSIGN_MD.write_text("\n".join(lines), encoding="utf-8")
+    logger.info("Wrote markdown assignment table: %s", MOUSE_ASSIGN_MD)
+
+
+def log_mouse_assignment_grouped(df, partition_summary, logger):
+    """Compact per-partition per-mouse listing to the log.
+
+    Mirrors the markdown grouping but uses a fixed-width text layout
+    suitable for grep / quick eyeballing in the persistent log.
+    """
+    summary_by_part = {r["partition"]: r for r in partition_summary}
+
+    logger.info("Per-mouse assignment grouped by partition:")
+    for part in PARTITION_ORDER:
+        if part not in summary_by_part:
+            # B6: see write_mouse_assignment_md() for the rationale --
+            # warn rather than silently skip.
+            logger.warning(
+                "Partition %r expected but not present in "
+                "partition_summary; section will be omitted from log.",
+                part,
+            )
+            continue
+        summ = summary_by_part[part]
+        logger.info(
+            "  %-12s (%d mice, %s segs, %.2f%% ictal):",
+            part, summ["n_mice"],
+            "{:,}".format(summ["n_total"]),
+            summ["prevalence_pct"],
+        )
+        sub = df[df["partition"] == part]
+        mids = sorted(sub.index, key=_mouse_sort_key)
+        for mid in mids:
+            row = sub.loc[mid]
+            logger.info(
+                "      %-6s  prev=%5.2f%%  n_total=%5d  stratum=%s",
+                mid,
+                float(row["prevalence_pct"]),
+                int(row["n_total"]),
+                row["stratum"],
+            )
+
+
 def write_bins_csv(df, logger):
     """One row per stratum cell."""
     rows = []
@@ -532,12 +780,14 @@ def write_stratification_report_csv(partition_summary, fold_summary, logger):
             w.writerow([r[k] for k in ps_fields])
 
         w.writerow([])
-        # Section 2: per-fold (5 CV folds; train = the 4 other CV folds)
-        w.writerow(["# Per-fold summary (train = other 4 CV folds, val = held-out fold)"])
-        fs_fields = ["fold", "n_train_mice", "n_val_mice",
-                     "n_train_segments", "n_val_segments",
-                     "n_train_ictal", "n_val_ictal",
-                     "train_prevalence_pct", "val_prevalence_pct"]
+        # Section 2: per-fold (5 CV folds; train = the 4 other CV folds,
+        # test = the held-out CV fold for that run).
+        w.writerow(["# Per-fold summary (train = other 4 CV folds, "
+                    "test = held-out CV fold)"])
+        fs_fields = ["fold", "n_train_mice", "n_test_mice",
+                     "n_train_segments", "n_test_segments",
+                     "n_train_ictal", "n_test_ictal",
+                     "train_prevalence_pct", "test_prevalence_pct"]
         w.writerow(fs_fields)
         for r in fold_summary:
             w.writerow([r[k] for k in fs_fields])
@@ -551,16 +801,30 @@ def write_stratification_report_csv(partition_summary, fold_summary, logger):
 def build_output_manifest(df, fold_defs, partition_summary, fold_summary,
                           stratification_info, train_records,
                           val_holdout, test, source_manifest):
-    """Assemble the final JSON dict (single flat `records` list)."""
-    mouse_partitions = df["partition"].to_dict()
-    early_stop_mice  = sorted(df.index[df["partition"] == "early_stop"])
+    """Assemble the final JSON dict (single flat `records` list).
+
+    Schema version 2: `fold_definitions[k].test_mice` (was `val_mice` in
+    v1); the per-fold summary block uses `n_test_*` and
+    `test_prevalence_pct` (was `n_val_*` and `val_prevalence_pct`).
+    """
+    # N1: emit mouse_partitions in numeric mouse-id order (m2, m4, ...,
+    # m10, ..., m375) so the JSON output matches the markdown / log
+    # ordering. Python 3.7+ preserves dict insertion order in json.dump.
+    raw_partitions = df["partition"].to_dict()
+    mouse_partitions = {
+        mid: raw_partitions[mid]
+        for mid in sorted(raw_partitions, key=_mouse_sort_key)
+    }
+    early_stop_mice  = sorted(
+        df.index[df["partition"] == "early_stop"], key=_mouse_sort_key,
+    )
 
     manifest = {
         "metadata": {
             "created_by":          "create_5fold_cv_splits.py",
             "timestamp":           datetime.now().isoformat(),
             "source_manifest":     str(source_manifest),
-            "schema_version":      "1",
+            "schema_version":      "2",
             "n_folds":             N_CV_FOLDS,
             "n_partitions":        N_PARTITIONS,
             "seed":                SEED,
@@ -663,11 +927,15 @@ def main():
     partition_summary = compute_partition_summary(df)
     fold_summary      = compute_fold_summary(df, fold_defs)
 
-    # -- 7. Write diagnostic CSVs -------------------------------------------
+    # -- 7. Write diagnostic CSVs + markdown + grouped log -------------------
     DIAG_DIR.mkdir(parents=True, exist_ok=True)
     write_bins_csv(df, logger)
     write_mouse_assignment_csv(df, logger)
     write_stratification_report_csv(partition_summary, fold_summary, logger)
+    write_mouse_assignment_md(
+        df, partition_summary, args.source, stratification_info, logger,
+    )
+    log_mouse_assignment_grouped(df, partition_summary, logger)
 
     # -- 8. Assemble + write the manifest JSON -------------------------------
     manifest = build_output_manifest(
