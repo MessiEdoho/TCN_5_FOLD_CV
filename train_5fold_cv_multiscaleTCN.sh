@@ -64,7 +64,7 @@ cd ~/TCN_5_FOLD_CV
 python train_5fold_cv_multiscaleTCN.py \
     --cv-manifest /home/people/22206468/scratch/INPUT_CV_PROJECT/manifest/data_splits_5fold_cv.json \
     --best-params /home/people/22206468/scratch/OUTPUT/MODEL3_OUTPUT/MultiScaleTCNtuning_outputs/best_multiscale_params.json \
-    --output-dir  /home/people/22206468/scratch/OUTPUT_CV/MultiScaleTCN \
+    --output-dir  /home/people/22206468/scratch/OUTPUT_CV_PROJECT/MODEL_3_MTCN \
     --folds       0,1,2,3,4
 
 echo "===== JOB END ====="

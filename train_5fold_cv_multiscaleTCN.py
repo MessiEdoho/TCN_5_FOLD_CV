@@ -153,7 +153,7 @@ DEFAULT_BEST_PARAMS = (
     "/home/people/22206468/scratch/OUTPUT/MODEL3_OUTPUT/"
     "MultiScaleTCNtuning_outputs/best_multiscale_params.json"
 )
-DEFAULT_OUTPUT_DIR = "/home/people/22206468/scratch/OUTPUT_CV/MultiScaleTCN"
+DEFAULT_OUTPUT_DIR = "/home/people/22206468/scratch/OUTPUT_CV_PROJECT/MODEL_3_MTCN"
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -194,14 +194,55 @@ def setup_logger(name: str, log_path: Path) -> logging.Logger:
 # ---------------------------------------------------------------------------
 # Data and model construction
 # ---------------------------------------------------------------------------
+REQUIRED_HP_KEYS = (
+    "num_filters", "kernel_size", "dropout", "fusion",
+    "learning_rate", "weight_decay", "batch_size",
+)
+
+
 def load_best_params(path: Path, logger: logging.Logger) -> dict:
+    """Load and validate the HPT best-params JSON.
+
+    P6: validates the full set of required HP keys up front and raises a
+    single clear error pointing at the offending file, rather than
+    crashing later with a generic KeyError mid-training (after the GPU is
+    allocated and possibly hundreds of seconds of dataloader spin-up).
+    """
+    if not path.exists():
+        raise FileNotFoundError(
+            "best-params JSON not found at %s. Pass --best-params or set "
+            "the file." % path
+        )
     with open(path, "r", encoding="utf-8") as f:
         payload = json.load(f)
+
+    if "hyperparameters" not in payload:
+        raise KeyError(
+            "best-params JSON %s missing top-level key 'hyperparameters'. "
+            "Top-level keys present: %s" % (path, sorted(payload.keys()))
+        )
     hp = payload["hyperparameters"]
+
+    missing_hp = [k for k in REQUIRED_HP_KEYS if k not in hp]
+    if missing_hp:
+        raise KeyError(
+            "best-params JSON %s 'hyperparameters' block is missing "
+            "required key(s): %s. Keys present: %s"
+            % (path, missing_hp, sorted(hp.keys()))
+        )
+
     branches = payload.get(
         "branch_dilations",
         {"branch1": [1, 2, 4], "branch2": [8, 16, 32], "branch3": [32, 64, 128]},
     )
+    for bk in ("branch1", "branch2", "branch3"):
+        if bk not in branches:
+            raise KeyError(
+                "best-params JSON %s 'branch_dilations' block is missing "
+                "key %r. Keys present: %s"
+                % (path, bk, sorted(branches.keys()))
+            )
+
     logger.info(
         "Loaded HPT best params: trial=%s, best_val_f1=%.6f",
         payload.get("best_trial_number", "?"),
@@ -224,6 +265,24 @@ def build_pairs(records: list, mouse_set: set) -> list:
     ]
 
 
+def build_pairs_with_mouse_id(records: list, mouse_set: set) -> tuple:
+    """Return (file_label_pairs, mouse_ids) in matching order.
+
+    P4: used for the test fold so the cached predictions NPZ records
+    the source mouse_id alongside each segment, enabling per-mouse
+    analyses downstream without having to re-derive the mapping.
+    Iteration order matches build_pairs(); DataLoader on this list with
+    shuffle=False preserves that order through to the model output.
+    """
+    pairs: list = []
+    mids: list = []
+    for r in records:
+        if r["mouse_id"] in mouse_set:
+            pairs.append((r["filepath"], int(r["label"])))
+            mids.append(r["mouse_id"])
+    return pairs, mids
+
+
 def build_model(hp: dict, branches: dict) -> nn.Module:
     return MultiScaleTCN(
         num_filters=int(hp["num_filters"]),
@@ -240,6 +299,22 @@ def count_params(model: nn.Module) -> tuple:
     total = sum(p.numel() for p in model.parameters())
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     return total, trainable
+
+
+def _mouse_sort_key(mid):
+    """Numeric mouse-id sort: 'm10' after 'm2'.
+
+    P3: mirrors the helper of the same name in create_5fold_cv_splits.py
+    so the mouse-id ordering in test_predictions.npz matches the order
+    used by the splits manifest, the markdown table, and the persistent
+    log. Falls back to lexicographic order for unrecognised id shapes.
+    """
+    s = str(mid)
+    rest = s[1:] if s.startswith("m") else s
+    try:
+        return (0, int(rest))
+    except ValueError:
+        return (1, s)
 
 
 # ---------------------------------------------------------------------------
@@ -335,8 +410,11 @@ def train_one_fold(
     assert not (test_mice & early_stop_mice), "test and early-stop mice overlap"
 
     train_pairs = build_pairs(records, train_mice)
-    es_pairs = build_pairs(records, early_stop_mice)
-    test_pairs = build_pairs(records, test_mice)
+    es_pairs    = build_pairs(records, early_stop_mice)
+    # P4: keep mouse_id alongside the test pairs so the cached predictions
+    # NPZ records per-segment provenance. DataLoader iterates in dataset
+    # order when shuffle=False, so test_mouse_ids[i] matches y_true[i].
+    test_pairs, test_mouse_ids = build_pairs_with_mouse_id(records, test_mice)
 
     logger.info(
         "Fold %d composition: train=%d segs / %d mice | early-stop=%d segs / "
@@ -346,8 +424,27 @@ def train_one_fold(
         len(test_pairs), len(test_mice),
     )
 
-    # Same seed across folds: same init, same dropout, same shuffle RNG.
-    # All fold-level variance is therefore attributable to partition variance.
+    # P1: refuse to train if any cohort is empty. Without this guard,
+    # forward_pass would crash later on np.concatenate([]) with an
+    # opaque numpy ValueError instead of naming the partition that is
+    # empty.
+    assert train_pairs, "Fold %d: train cohort is empty." % fold_idx
+    assert es_pairs,    "Fold %d: early-stop cohort is empty." % fold_idx
+    assert test_pairs,  "Fold %d: test cohort is empty." % fold_idx
+
+    # Same seed across folds: same init, same dropout, same main-process
+    # shuffle RNG. All fold-level variance is therefore attributable to
+    # partition variance.
+    # P5 note on DataLoader worker RNG: workers (num_workers=4 inside the
+    # parent's make_loader) get independent per-worker seeds and are not
+    # explicitly re-seeded here. This is intentional and safe in this
+    # pipeline because the dataset (EEGSegmentDataset in tcn_utils.py)
+    # performs only deterministic np.load() with no stochastic
+    # augmentation, normalisation, or sampling inside __getitem__, so
+    # worker RNG state never influences the returned tensors. The
+    # main-process RNG (seeded above) controls model init, dropout, and
+    # per-epoch shuffle order, which is sufficient for per-fold
+    # determinism of the trained weights and the test predictions.
     set_seed(SEED)
 
     hp = hp_payload["hp"]
@@ -445,7 +542,18 @@ def train_one_fold(
     )
 
     # Restore best weights for the single, final test-fold evaluation.
-    assert best_state is not None, "best_state was never set"
+    # P2: include diagnostic context so an unexpected None doesn't look
+    # like an opaque "best_state was never set" -- it tells you exactly
+    # which fold and at what loop state the invariant broke.
+    assert best_state is not None, (
+        "Fold %d: best_state was never set. Last seen best_f1=%.5f, "
+        "best_epoch=%d, no_improve=%d, last epoch reached=%d. This "
+        "typically means the very first val pass raised an exception "
+        "before any improvement could be recorded -- inspect the per-"
+        "epoch log above for the underlying error."
+        % (fold_idx, best_f1, best_epoch, no_improve,
+           history["epoch"][-1] if history["epoch"] else 0)
+    )
     model.load_state_dict(best_state)
     model.to(DEVICE)
 
@@ -464,12 +572,23 @@ def train_one_fold(
     })
 
     y_pred_test = (y_prob_test >= THRESHOLD).astype(np.int64)
+    # P3: numeric sort for the unique-mouse list so the order matches the
+    # splits manifest (m2, m10, m100 -- not m10, m100, m2).
+    # P4: also persist per-segment mouse_id, ordered identically to
+    # y_true/y_prob/y_pred (DataLoader was constructed with shuffle=False
+    # and test_pairs/test_mouse_ids were built in matching order).
+    assert len(test_mouse_ids) == len(y_true_test), (
+        "Fold %d: per-segment mouse_ids length (%d) does not match "
+        "y_true length (%d); aborting NPZ write to avoid a corrupted "
+        "predictions file." % (fold_idx, len(test_mouse_ids), len(y_true_test))
+    )
     np.savez_compressed(
         fold_dir / "test_predictions.npz",
         y_true=y_true_test,
         y_prob=y_prob_test,
         y_pred=y_pred_test,
-        test_mice=np.array(sorted(test_mice), dtype="<U32"),
+        mouse_id=np.array(test_mouse_ids, dtype="<U32"),
+        test_mice=np.array(sorted(test_mice, key=_mouse_sort_key), dtype="<U32"),
         threshold=np.float32(THRESHOLD),
     )
     with open(fold_dir / "test_metrics.json", "w", encoding="utf-8") as f:
@@ -545,12 +664,14 @@ def aggregate_results(
 # Entry point
 # ---------------------------------------------------------------------------
 def parse_args() -> argparse.Namespace:
+    # N4: type=Path on all three filesystem paths so they are normalised
+    # by argparse and downstream code can use Path methods uniformly.
     p = argparse.ArgumentParser(description=__doc__.splitlines()[1])
-    p.add_argument("--cv-manifest", default=DEFAULT_CV_MANIFEST,
+    p.add_argument("--cv-manifest", type=Path, default=Path(DEFAULT_CV_MANIFEST),
                    help="Path to data_splits_5fold_cv.json")
-    p.add_argument("--best-params", default=DEFAULT_BEST_PARAMS,
+    p.add_argument("--best-params", type=Path, default=Path(DEFAULT_BEST_PARAMS),
                    help="Path to best_multiscale_params.json")
-    p.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR,
+    p.add_argument("--output-dir", type=Path, default=Path(DEFAULT_OUTPUT_DIR),
                    help="Root output directory (one subdir per fold)")
     p.add_argument("--folds", default="0,1,2,3,4",
                    help="Comma-separated fold indices to run (default: all 5)")
@@ -559,7 +680,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    output_dir = Path(args.output_dir)
+    output_dir: Path = args.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
 
     main_logger = setup_logger("cv_main", output_dir / "cv_summary.log")
@@ -574,9 +695,19 @@ def main() -> None:
         MAX_EPOCHS, ES_PATIENCE, THRESHOLD, SEED,
     )
 
+    # Fail loud and early if input paths are missing.
+    if not args.cv_manifest.exists():
+        main_logger.error("CV manifest not found: %s", args.cv_manifest)
+        sys.exit(1)
+    # best-params existence is also checked inside load_best_params(),
+    # but checking here lets us abort before the cv-manifest is parsed.
+    if not args.best_params.exists():
+        main_logger.error("best-params JSON not found: %s", args.best_params)
+        sys.exit(1)
+
     with open(args.cv_manifest, "r", encoding="utf-8") as f:
         splits = json.load(f)
-    hp_payload = load_best_params(Path(args.best_params), main_logger)
+    hp_payload = load_best_params(args.best_params, main_logger)
 
     fold_indices = [int(x) for x in args.folds.split(",") if x.strip()]
     for k in fold_indices:

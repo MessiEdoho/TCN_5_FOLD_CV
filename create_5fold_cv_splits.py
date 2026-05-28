@@ -335,20 +335,19 @@ def assign_crossed_strata(df, logger):
         for cell, n in sorted(cell_counts.items()):
             logger.info("  %-12s : %d mice", cell, n)
 
-        # N2: unified key names. Median-based thresholds don't apply in the
-        # tertile branch, so prev_threshold / vol_threshold are explicit
-        # nulls; the tertile edges themselves are recorded as a sibling
-        # field so the actual cuts are still auditable.
+        # N3: both branches now expose the same set of keys, so downstream
+        # consumers can read every field without first switching on
+        # `binning`. Keys that don't apply to a branch are explicit nulls.
         info = {
-            "binning":           "prevalence_tertiles_fallback",
-            "prev_threshold":    None,
-            "vol_threshold":     None,
+            "binning":            "prevalence_tertiles_fallback",
+            "prev_threshold":     None,
+            "vol_threshold":      None,
             "prev_tertile_edges": [float(x) for x in tertile_edges],
-            "cell_counts":       cell_counts,
-            "fallback_used":     True,
-            "fallback_reason":   qcut_failure
-                                 or "2x2 crossed produced cell < MIN_CELL_SIZE",
-            "small_cells":       too_small,
+            "cell_counts":        cell_counts,
+            "fallback_used":      True,
+            "fallback_reason":    qcut_failure
+                                  or "2x2 crossed produced cell < MIN_CELL_SIZE",
+            "small_cells":        too_small,
         }
     else:
         # B7: prev_threshold / vol_threshold are taken from the actual
@@ -357,13 +356,18 @@ def assign_crossed_strata(df, logger):
         # mice in df["prev_bin"] / df["vol_bin"].
         prev_threshold = float(prev_edges[1])
         vol_threshold  = float(vol_edges[1])
+        # N3: same key set as the fallback branch -- prev_tertile_edges and
+        # small_cells are present but null, so a downstream consumer can
+        # read every field without branching on `binning`.
         info = {
-            "binning":          "2x2_crossed_median",
-            "prev_threshold":   prev_threshold,
-            "vol_threshold":    vol_threshold,
-            "cell_counts":      cell_counts,
-            "fallback_used":    False,
-            "fallback_reason":  None,
+            "binning":            "2x2_crossed_median",
+            "prev_threshold":     prev_threshold,
+            "vol_threshold":      vol_threshold,
+            "prev_tertile_edges": None,
+            "cell_counts":        cell_counts,
+            "fallback_used":      False,
+            "fallback_reason":    None,
+            "small_cells":        None,
         }
         logger.info("2x2 crossed binning OK (all cells >= %d).", MIN_CELL_SIZE)
         logger.info("  prev_threshold (qcut split) : %.4f %%", prev_threshold)
@@ -393,7 +397,10 @@ def partition_mice(df, logger):
     X = np.arange(len(df))
     y = df["stratum"].to_numpy()
 
-    partition_labels = np.empty(len(df), dtype=object)
+    # N5: np.full(..., None, dtype=object) makes the initial None-fill
+    # explicit. np.empty(..., dtype=object) also fills with None in
+    # CPython by default, but the contract is implicit and could change.
+    partition_labels = np.full(len(df), None, dtype=object)
     for group_idx, (_, test_idx) in enumerate(skf.split(X, y)):
         if group_idx == EARLY_STOP_GROUP:
             label = "early_stop"
@@ -442,10 +449,14 @@ def partition_mice(df, logger):
 # ---------------------------------------------------------------------------
 # Disjointness check
 # ---------------------------------------------------------------------------
-def assert_partitions_disjoint(df, val_holdout, test, logger):
+def assert_partitions_disjoint(df, val_records, test_records, logger):
     """Verify the 6 partitions are pairwise disjoint and don't touch
     the upstream val_holdout / test mice. This is the same invariant
     as run_leakage_check() in generate_data_splits.py.
+
+    N2: parameters were renamed (`val_holdout` -> `val_records`,
+    `test` -> `test_records`) to mirror the local variable names in
+    main() and to avoid shadowing the conventional `test` token.
     """
     partition_mice = {}
     for part in sorted(df["partition"].unique()):
@@ -460,8 +471,8 @@ def assert_partitions_disjoint(df, val_holdout, test, logger):
             )
 
     train_mice    = set(df.index)
-    holdout_mice  = {r["mouse_id"] for r in val_holdout}
-    upstream_test = {r["mouse_id"] for r in test}
+    holdout_mice  = {r["mouse_id"] for r in val_records}
+    upstream_test = {r["mouse_id"] for r in test_records}
 
     cross_holdout = train_mice & holdout_mice
     cross_test    = train_mice & upstream_test
@@ -505,14 +516,18 @@ def build_fold_definitions(df):
     terminology (the held-out CV partition is the per-fold *test* set;
     `val_holdout` denotes a distinct upstream HPT cohort).
     """
+    # P7: build the train mask from the explicit set of CV fold labels
+    # rather than via a string-prefix match. This decouples the train
+    # selection from the partition-naming convention -- a future
+    # partition whose name happens to start with "fold_" (e.g.
+    # "fold_holdout") will no longer silently leak into train.
+    cv_fold_labels = {"fold_%d" % i for i in range(N_CV_FOLDS)}
     fold_defs = []
     for k in range(N_CV_FOLDS):
-        test_mice = sorted(df.index[df["partition"] == "fold_%d" % k])
-        # train = the OTHER cv folds; early_stop is NOT in train
-        train_mask = (
-            df["partition"].str.startswith("fold_")
-            & (df["partition"] != "fold_%d" % k)
-        )
+        held_out_label = "fold_%d" % k
+        test_mice = sorted(df.index[df["partition"] == held_out_label])
+        train_labels = cv_fold_labels - {held_out_label}
+        train_mask = df["partition"].isin(train_labels)
         train_mice = sorted(df.index[train_mask])
         fold_defs.append({
             "fold":        k,
@@ -525,6 +540,20 @@ def build_fold_definitions(df):
 # ---------------------------------------------------------------------------
 # Per-fold summary statistics (for metadata + diagnostic CSV)
 # ---------------------------------------------------------------------------
+def _safe_prevalence_pct(ictal_sum, total_sum):
+    """B2: avoid ZeroDivisionError on empty partitions.
+
+    Returns the prevalence as a percentage, or 0.0 when the partition has
+    no segments (which would only happen if a future schema change leaves
+    a partition empty; not expected under the current N=71 / 6-partition
+    layout).
+    """
+    total = int(total_sum)
+    if total == 0:
+        return 0.0
+    return round(100.0 * int(ictal_sum) / total, 4)
+
+
 def compute_fold_summary(df, fold_defs):
     rows = []
     for fd in fold_defs:
@@ -538,10 +567,10 @@ def compute_fold_summary(df, fold_defs):
             "n_test_segments":       int(test["n_total"].sum()),
             "n_train_ictal":         int(train["n_ictal"].sum()),
             "n_test_ictal":          int(test["n_ictal"].sum()),
-            "train_prevalence_pct":  round(
-                100.0 * train["n_ictal"].sum() / train["n_total"].sum(), 4),
-            "test_prevalence_pct":   round(
-                100.0 * test["n_ictal"].sum() / test["n_total"].sum(), 4),
+            "train_prevalence_pct":  _safe_prevalence_pct(
+                train["n_ictal"].sum(), train["n_total"].sum()),
+            "test_prevalence_pct":   _safe_prevalence_pct(
+                test["n_ictal"].sum(),  test["n_total"].sum()),
         })
     return rows
 
@@ -556,11 +585,12 @@ def compute_partition_summary(df):
             "n_ictal":            int(sub["n_ictal"].sum()),
             "n_nonictal":         int(sub["n_nonictal"].sum()),
             "n_total":            int(sub["n_total"].sum()),
-            "prevalence_pct":     round(
-                100.0 * sub["n_ictal"].sum() / sub["n_total"].sum(), 4),
-            "mean_mouse_volume":  round(float(sub["n_total"].mean()), 1),
+            "prevalence_pct":     _safe_prevalence_pct(
+                sub["n_ictal"].sum(), sub["n_total"].sum()),
+            "mean_mouse_volume":  round(float(sub["n_total"].mean()), 1)
+                                   if len(sub) else 0.0,
             "mean_mouse_prevalence_pct": round(
-                float(sub["prevalence_pct"].mean()), 4),
+                float(sub["prevalence_pct"].mean()), 4) if len(sub) else 0.0,
         })
     return rows
 
@@ -887,18 +917,39 @@ def main():
         logger.error("Source manifest not found: %s", args.source)
         sys.exit(1)
 
-    splits         = json.loads(args.source.read_text(encoding="utf-8"))
-    train_records  = splits.get("train", [])
-    val_holdout    = splits.get("val", [])
-    test_records   = splits.get("test", [])
+    splits = json.loads(args.source.read_text(encoding="utf-8"))
 
-    if not train_records:
-        logger.error("Source manifest has empty 'train' partition.")
+    # B1: require the three upstream keys explicitly. Previously these were
+    # silently defaulted to [] via .get(...), which let a manifest with the
+    # wrong key names (e.g. "val_holdout" instead of "val") through with an
+    # empty val/test cohort -- the leakage check then passed vacuously and
+    # the training script later failed in a confusing way mid-training.
+    missing = [k for k in ("train", "val", "test") if k not in splits]
+    if missing:
+        logger.error(
+            "Source manifest is missing required top-level key(s): %s. "
+            "Found keys: %s.", missing, sorted(splits.keys()))
         sys.exit(1)
+
+    train_records = splits["train"]
+    # Note: the *input* key is "val" (upstream convention from
+    # generate_data_splits.py); the *output* key in this script's manifest
+    # is "val_holdout", to disambiguate from the per-fold CV holdouts.
+    val_records   = splits["val"]
+    test_records  = splits["test"]
+
+    for name, recs in [("train", train_records),
+                       ("val",   val_records),
+                       ("test",  test_records)]:
+        if not recs:
+            logger.error(
+                "Source manifest has empty '%s' partition; cannot proceed.",
+                name)
+            sys.exit(1)
 
     logger.info("Loaded source manifest:")
     logger.info("  train       : %d segments", len(train_records))
-    logger.info("  val_holdout : %d segments", len(val_holdout))
+    logger.info("  val_holdout : %d segments", len(val_records))
     logger.info("  test        : %d segments", len(test_records))
 
     # -- 2. Per-mouse aggregation + sanity check -----------------------------
@@ -920,7 +971,7 @@ def main():
     df = partition_mice(df, logger)
 
     # -- 5. Disjointness / leakage check ------------------------------------
-    assert_partitions_disjoint(df, val_holdout, test_records, logger)
+    assert_partitions_disjoint(df, val_records, test_records, logger)
 
     # -- 6. Build fold_definitions + summary stats --------------------------
     fold_defs         = build_fold_definitions(df)
@@ -945,7 +996,7 @@ def main():
         fold_summary=fold_summary,
         stratification_info=stratification_info,
         train_records=train_records,
-        val_holdout=val_holdout,
+        val_holdout=val_records,
         test=test_records,
         source_manifest=args.source,
     )

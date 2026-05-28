@@ -853,7 +853,7 @@ cross-validation for model selection. *BMC Bioinformatics*, 7(1), 91.
 
 ### A.2 Training + evaluation outputs (`train_5fold_cv_multiscaleTCN.py`)
 
-Default output root: `OUTPUT_CV/MultiScaleTCN/`.
+Default output root: `/home/people/22206468/scratch/OUTPUT_CV_PROJECT/MODEL_3_MTCN/`.
 
 | Path | Purpose |
 |---|---|
