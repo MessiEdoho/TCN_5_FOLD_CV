@@ -851,20 +851,54 @@ cross-validation for model selection. *BMC Bioinformatics*, 7(1), 91.
 | `INPUT_CV_PROJECT/diagnostics/fold_stratification_report.csv` | Per-partition and per-fold summary statistics |
 | `INPUT_CV_PROJECT/logs/create_5fold_cv_splits.log` | Persistent append-mode invocation log |
 
-### A.2 Training + evaluation outputs (`train_5fold_cv_multiscaleTCN.py`)
+### A.2 Training + evaluation outputs (per-architecture)
 
-Default output root: `/home/people/22206468/scratch/OUTPUT_CV_PROJECT/MODEL_3_MTCN/`.
+Per-architecture output roots under
+`/home/people/22206468/scratch/OUTPUT_CV_PROJECT/`:
+
+| Architecture | Script | Output root |
+|---|---|---|
+| MultiScaleTCN (M3) | `train_5fold_cv_multiscaleTCN.py` | `MODEL_3_MTCN/` |
+| MultiScaleTCNWithAttention (M4) | `train_5fold_cv_multiscaleTCNwithATTN.py` | `MODEL_4_MTCN_ATTN/` |
+
+The per-fold artefact layout is identical across architectures:
 
 | Path | Purpose |
 |---|---|
 | `fold{k}/best_weights.pt` | Model `state_dict` at the epoch of highest `val_macro_F1` for fold *k* |
 | `fold{k}/training_history.csv` | Per-epoch `train_loss`, `val_loss`, `val_f1`, `lr` for fold *k* |
-| `fold{k}/test_predictions.npz` | `y_true`, `y_prob`, `y_pred`, `test_mice`, `threshold` on the held-out CV partition for fold *k* |
+| `fold{k}/test_predictions.npz` | `y_true`, `y_prob`, `y_pred`, `mouse_id` (per-segment), `test_mice` (unique, numeric-sorted), `threshold` on the held-out CV partition for fold *k* |
 | `fold{k}/test_metrics.json` | Eight scalar metrics plus `best_epoch`, `best_val_macro_f1`, `test_loss`, segment and mouse counts for fold *k* |
 | `fold{k}/train.log` | Per-epoch log for fold *k* |
 | `cv_summary.csv` | Per-fold metric rows + `mean` row + `std` row |
 | `cv_summary.json` | Same content as `cv_summary.csv` in nested form |
 | `cv_summary.log` | End-to-end run log spanning all folds |
+
+### A.2.1 M4-specific protocol deltas vs M3
+
+The M4 script is otherwise byte-for-byte similar to the M3 script
+(same optimiser, scheduler, loss, gradient clipping, AMP regime
+during training, early-stop policy, and aggregation). Two deltas:
+
+1. **Two HP JSONs**. M4 loads
+   `best_multiscale_params.json` (backbone HPs, held fixed during the
+   M4 study) and
+   `best_multiscale_attn_params.json` (attention HPs +
+   re-tuned `learning_rate` / `weight_decay` / `batch_size`). The
+   loader asserts that the attn JSON's embedded
+   `backbone_hyperparameters` snapshot agrees with the live backbone
+   JSON, and aborts on disagreement to prevent training on a stale
+   snapshot.
+
+2. **FP32 forward for the final test-fold pass**. The per-epoch
+   early-stop monitor still uses AMP, but the single test-fold pass
+   that produces the reported CV metrics runs in pure FP32. This
+   mirrors the parent `eval_utils.py` "Layer 3" NaN protection: the
+   attention softmax can overflow in FP16 on adversarial inputs, and
+   any silent NaN in attention weights would corrupt the
+   cross-architecture comparison with M3. Training and per-epoch
+   monitoring on AMP, final eval on FP32, is the same regime the
+   parent driver `MultiScaleTCNAttention.py` uses.
 
 ## Appendix B. Configuration Parameters
 
