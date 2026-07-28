@@ -110,6 +110,7 @@ Outputs (all under /home/people/22206468/scratch/INPUT_CV_PROJECT/)
   diagnostics/fold_mouse_assignment.csv
   diagnostics/fold_mouse_assignment.md
   diagnostics/fold_stratification_report.csv
+  diagnostics/partition_seizure_segment_counts.png
   logs/create_5fold_cv_splits.log
 
 Usage
@@ -150,6 +151,8 @@ BINS_CSV              = DIAG_DIR / "prevalence_volume_bins.csv"
 MOUSE_ASSIGN_CSV      = DIAG_DIR / "fold_mouse_assignment.csv"
 MOUSE_ASSIGN_MD       = DIAG_DIR / "fold_mouse_assignment.md"
 STRATIFICATION_CSV    = DIAG_DIR / "fold_stratification_report.csv"
+PARTITION_COUNTS_PNG  = DIAG_DIR / "partition_seizure_segment_counts.png"
+PARTITION_COUNTS_PDF  = DIAG_DIR / "partition_seizure_segment_counts.pdf"
 LOG_PATH              = LOGS_DIR / "create_5fold_cv_splits.log"
 
 # CV design
@@ -794,6 +797,113 @@ def write_bins_csv(df, logger):
         logger=logger)
 
 
+def write_partition_counts_plot(partition_summary, logger):
+    """Stacked bar chart of seizure (ictal) and non-ictal segment counts
+    per partition. Annotated with total segment count and ictal
+    prevalence above each bar. Saved to PARTITION_COUNTS_PNG.
+
+    matplotlib is imported lazily inside this function so the rest of
+    the script remains usable on minimal environments without it. If
+    the import fails, the plot is skipped with a warning rather than
+    aborting the whole splits-build.
+    """
+    try:
+        import matplotlib
+        matplotlib.use("Agg")  # non-interactive backend, safe in batch
+        import matplotlib.pyplot as plt
+    except ImportError as e:
+        logger.warning(
+            "matplotlib not available (%s); skipping "
+            "partition_seizure_segment_counts.png. Install matplotlib in "
+            "the cluster env to enable this diagnostic.", e,
+        )
+        return
+
+    PARTITION_COUNTS_PNG.parent.mkdir(parents=True, exist_ok=True)
+    summary_by_part = {r["partition"]: r for r in partition_summary}
+
+    labels = [p for p in PARTITION_ORDER if p in summary_by_part]
+    ictal     = [summary_by_part[p]["n_ictal"]     for p in labels]
+    nonictal  = [summary_by_part[p]["n_nonictal"]  for p in labels]
+    totals    = [summary_by_part[p]["n_total"]     for p in labels]
+    prev_pcts = [summary_by_part[p]["prevalence_pct"] for p in labels]
+    mice      = [summary_by_part[p]["n_mice"]      for p in labels]
+
+    # Font sizes are deliberately large: the figure is dropped into a
+    # single manuscript column, so it gets scaled down substantially.
+    # Sizing type up here keeps bar labels legible after that shrink, and
+    # the near-square aspect ratio makes the six bars chunky rather than
+    # thin. A vector PDF plus a 300-dpi PNG are both written so the figure
+    # stays crisp at any print size.
+    plt.rcParams.update({
+        "font.family":      "DejaVu Sans",
+        "font.size":        13,
+        "axes.titlesize":   14,
+        "axes.labelsize":   15,
+        "xtick.labelsize":  13,
+        "ytick.labelsize":  13,
+        "legend.fontsize":  13,
+    })
+
+    fig, ax = plt.subplots(figsize=(7.2, 6.6))
+    x = list(range(len(labels)))
+    bar_width = 0.74
+
+    # Ictal at the bottom, non-ictal stacked on top. The visual emphasis
+    # is intentional: the ictal portion is the minority class we care
+    # about, and stacking it at the base makes its absolute height the
+    # easiest thing to read at a glance.
+    ax.bar(
+        x, ictal, width=bar_width, color="#d6604d", edgecolor="black",
+        linewidth=0.8, label="ictal (seizure)",
+    )
+    ax.bar(
+        x, nonictal, width=bar_width, bottom=ictal, color="#4393c3",
+        edgecolor="black", linewidth=0.8, label="non-ictal",
+    )
+
+    # Annotate each bar with mouse count, total segments, and prevalence.
+    # Three lines; headroom on the y-axis below is sized to fit them.
+    for i, (tot, prev, nm) in enumerate(zip(totals, prev_pcts, mice)):
+        ax.text(
+            x[i], tot + max(totals) * 0.012,
+            "%d mice\nn=%s\n%.1f%% ictal"
+            % (nm, "{:,}".format(tot), prev),
+            ha="center", va="bottom", fontsize=12, linespacing=1.35,
+        )
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, rotation=20, ha="right")
+    ax.set_ylabel("segment count")
+    ax.set_title(
+        "Per-partition seizure and segment counts\n"
+        "(stratified 5-fold CV + fixed early-stop partition, "
+        "n_train_mice=%d)"
+        % sum(summary_by_part[p]["n_mice"] for p in labels),
+        pad=12,
+    )
+    ax.set_ylim(0, max(totals) * 1.32)  # headroom for the 3-line annotation
+    ax.margins(x=0.02)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.tick_params(length=4)
+    ax.grid(axis="y", linestyle=":", alpha=0.45)
+    ax.set_axisbelow(True)
+    # Legend outside the data axes so it can't overlap the per-bar text
+    # annotations no matter where the tallest bar sits.
+    ax.legend(
+        loc="lower center", bbox_to_anchor=(0.5, -0.22),
+        ncol=2, frameon=False,
+    )
+
+    fig.tight_layout()
+    fig.savefig(PARTITION_COUNTS_PDF, bbox_inches="tight")       # vector
+    fig.savefig(PARTITION_COUNTS_PNG, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    logger.info("Wrote partition counts barplot: %s (+ .pdf)",
+                PARTITION_COUNTS_PNG)
+
+
 def write_stratification_report_csv(partition_summary, fold_summary, logger):
     """Two-section CSV: partition summary (6 rows) + per-fold summary."""
     DIAG_DIR.mkdir(parents=True, exist_ok=True)
@@ -978,7 +1088,7 @@ def main():
     partition_summary = compute_partition_summary(df)
     fold_summary      = compute_fold_summary(df, fold_defs)
 
-    # -- 7. Write diagnostic CSVs + markdown + grouped log -------------------
+    # -- 7. Write diagnostic CSVs + markdown + grouped log + barplot ---------
     DIAG_DIR.mkdir(parents=True, exist_ok=True)
     write_bins_csv(df, logger)
     write_mouse_assignment_csv(df, logger)
@@ -987,6 +1097,7 @@ def main():
         df, partition_summary, args.source, stratification_info, logger,
     )
     log_mouse_assignment_grouped(df, partition_summary, logger)
+    write_partition_counts_plot(partition_summary, logger)
 
     # -- 8. Assemble + write the manifest JSON -------------------------------
     manifest = build_output_manifest(

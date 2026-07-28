@@ -849,6 +849,7 @@ cross-validation for model selection. *BMC Bioinformatics*, 7(1), 91.
 | `INPUT_CV_PROJECT/diagnostics/fold_mouse_assignment.csv` | Per-subject assignment with binning variables and partition label |
 | `INPUT_CV_PROJECT/diagnostics/fold_mouse_assignment.md` | Same content as the CSV but rendered as markdown sub-tables, one per partition (`early_stop` first, then `fold_0..fold_4`), each preceded by a one-line summary of mouse count, segment count, and ictal prevalence. Suitable for direct paste into this report or a manuscript supplement. |
 | `INPUT_CV_PROJECT/diagnostics/fold_stratification_report.csv` | Per-partition and per-fold summary statistics |
+| `INPUT_CV_PROJECT/diagnostics/partition_seizure_segment_counts.png` | Stacked bar chart, one bar per partition (`early_stop`, `fold_0..fold_4`). Bar height = total segment count, split into ictal (seizure) at the base and non-ictal on top. Annotated above each bar with `n_total` and `prevalence_pct`. Single-glance check that stratification balanced both segment volume and ictal proportion across partitions. |
 | `INPUT_CV_PROJECT/logs/create_5fold_cv_splits.log` | Persistent append-mode invocation log |
 
 ### A.2 Training + evaluation outputs (per-architecture)
